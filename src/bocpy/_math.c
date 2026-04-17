@@ -1927,7 +1927,7 @@ static PyGetSetDef Matrix_getset[] = {
     {NULL} /* Sentinel */
 };
 
-inline enum BinaryOps swap_right(enum BinaryOps op) {
+static inline enum BinaryOps swap_right(enum BinaryOps op) {
   switch (op) {
   case Subtract:
     return RSubtract;

@@ -123,6 +123,8 @@ static inline void boc_park_wait(BOCQueue *q);
 #if PY_VERSION_HEX >= 0x030D0000
 #define Py_BUILD_CORE
 #include <internal/pycore_crossinterp.h>
+#include <internal/pycore_immutability.h>
+#define Region_Check(x) Py_IS_TYPE((x), &_PyTracingRegion_Type)
 #endif
 
 const struct timespec SLEEP_TS = {0, 1000};
@@ -830,6 +832,20 @@ static PyObject *xidata_to_object(XIDATA_T *xidata, bool pickled) {
   return value;
 }
 
+static PyObject *xidata_to_region(XIDATA_T *xidata) {
+  assert(xidata != NULL);
+  assert(Region_Check(xidata->obj));
+  assert(xidata->data == NULL);
+
+  PyObject* region = xidata->obj;
+  xidata->obj = NULL;
+  if (_PyTracingRegion_Open(region)) {
+    return NULL;
+  }
+
+  return region;
+}
+
 /// @brief Serializes an object as xidata
 /// @param module The _core module
 /// @param contents The value to serialize
@@ -874,6 +890,24 @@ static PyObject *object_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
   PyErr_SetString(PyExc_RuntimeError,
                   "Unable to convert contents to cross-interpreter data");
   return NULL;
+}
+
+static PyObject *region_to_xidata(PyObject *value, XIDATA_T **xidata_ptr) {
+  assert(Region_Check(value));
+  assert(*xidata_ptr == NULL);
+
+  *xidata_ptr = XIDATA_NEW();
+  XIDATA_T *xidata = *xidata_ptr;
+
+  if (xidata == NULL) {
+    PyErr_NoMemory();
+    return NULL;
+  }
+
+  xidata->data = NULL;
+  xidata->obj = Py_NewRef(value);
+
+  Py_RETURN_TRUE;
 }
 
 /// @brief The threadsafe cown object.
@@ -1417,7 +1451,11 @@ static int cown_acquire(BOCCown *cown) {
 
   assert(cown->value == NULL);
   assert(cown->xidata != NULL);
-  cown->value = xidata_to_object(cown->xidata, cown->pickled);
+  if (cown->xidata->data == NULL && cown->xidata->obj && Region_Check(cown->xidata->obj)) {
+    cown->value = xidata_to_region(cown->xidata);
+  } else {
+    cown->value = xidata_to_object(cown->xidata, cown->pickled);
+  }
 
   if (cown->value == NULL) {
     return -1;
@@ -1469,7 +1507,26 @@ static int cown_release(BOCCown *cown) {
   assert(cown->value != NULL);
   assert(cown->xidata == NULL);
 
-  PyObject *pickled = object_to_xidata(cown->value, &cown->xidata);
+  PyObject *pickled = NULL;
+
+  // Tracing regions can only be shared via cowns, since they require a thread
+  // safe container with an owning reference. This would not be a given if
+  // this check is build into `object_to_xidata`
+  if (Region_Check(cown->value)) {
+    int close_res = _PyTracingRegion_Close(cown->value);
+    if (close_res < 0) {
+        return -1;
+    }
+    if (close_res == 0) {
+        PyErr_Format(
+            PyExc_RuntimeError,
+            "the cown can't be released, since the contained region is still open");
+        return -1;
+    }
+    pickled = region_to_xidata(cown->value, &cown->xidata);
+  } else {
+    pickled = object_to_xidata(cown->value, &cown->xidata);
+  }
 
   if (pickled == NULL) {
     return -1;
