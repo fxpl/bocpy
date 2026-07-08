@@ -136,7 +136,7 @@ class WaitResult(NamedTuple):
 class Cown(Generic[T]):
     """Lightweight wrapper around the underlying cown capsule."""
 
-    def __init__(self, value: T):
+    def __init__(self, value: T = None):
         """Create a cown.
 
         .. note::
@@ -356,7 +356,7 @@ class PinnedCown(Cown[T]):
           not split across interpreters.
     """
 
-    def __init__(self, value: T):
+    def __init__(self, value: T = None):
         """Create a pinned cown wrapping *value*.
 
         :param value: The initial value to wrap. Stored as a plain

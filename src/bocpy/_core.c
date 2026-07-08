@@ -11,6 +11,18 @@
 #include <bocpy/bocpy.h>
 #include <limits.h>
 
+#if PY_VERSION_HEX >= 0x030D0000
+#define Py_BUILD_CORE
+#include <internal/pycore_immutability.h>
+#define Region_Check(x) Py_IS_TYPE((x), &_PyTracingRegion_Type)
+#undef Py_BUILD_CORE
+#else
+#   error "This requires the pyrona fork on `tracing-region`"
+#endif
+#define TRACING_REGIONS
+#define TRACING_REGION_XIDATA_MAGIC_VALUE 0x12344321
+static PyObject *xidata_to_region(XIDATA_T *xidata);
+
 typedef struct boc_queue BOCQueue;
 
 /// @brief Initialize the park mutex and condition variable for a queue
@@ -409,6 +421,13 @@ static PyObject *_PyPickle_Loads(PyObject *bytes) {
 /// @return A new instance of the object
 static PyObject *xidata_to_object(XIDATA_T *xidata, bool pickled) {
   assert(xidata != NULL);
+
+#ifdef TRACING_REGIONS
+  if (xidata->data == (void*)TRACING_REGION_XIDATA_MAGIC_VALUE) {
+    return xidata_to_region(xidata);
+  }
+#endif
+
   PyObject *value = XIDATA_NEWOBJECT(xidata);
   if (value == NULL) {
     return NULL;
@@ -1075,6 +1094,81 @@ typedef struct boc_cown {
   /// @brief Atomic weak reference count for the cown
   atomic_int_least64_t weak_rc;
 } BOCCown;
+
+#ifdef TRACING_REGIONS
+static PyObject *xidata_to_region(XIDATA_T *xidata) {
+  assert(xidata != NULL);
+  assert(Region_Check(xidata->obj));
+  assert(xidata->data == (void*)TRACING_REGION_XIDATA_MAGIC_VALUE);
+
+  PyObject* region = xidata->obj;
+  xidata->obj = NULL;
+  xidata->data = NULL;
+  if (_PyTracingRegion_Open(region)) {
+    return NULL;
+  }
+
+  return region;
+}
+
+static PyObject *region_to_xidata(BOCCown *cown, XIDATA_T **xidata_ptr) {
+  if (*xidata_ptr == NULL) {
+    *xidata_ptr = XIDATA_NEW();
+  }
+
+  XIDATA_T *xidata = *xidata_ptr;
+
+  if (xidata == NULL) {
+    PyErr_NoMemory();
+    return NULL;
+  }
+
+  // We use a magic value to mark that this xidata holds a tracing region
+  xidata->data = (void*)TRACING_REGION_XIDATA_MAGIC_VALUE;
+
+  // Stealing the closed region from the cown
+  xidata->obj = cown->value;
+  cown->value = NULL;
+
+  Py_RETURN_FALSE;
+}
+
+static PyObject* region_release(BOCCown *cown, XIDATA_T **xidata_ptr) {
+  assert(Region_Check(cown->value));
+
+  int close_res = _PyTracingRegion_Close(cown->value);
+  if (close_res < 0) {
+    return NULL;
+  }
+
+  // If the region couldn't be closed, we need to create an exception and store
+  // it in the cown.
+  if (close_res == 0) {
+    PyObject *msg = PyUnicode_FromFormat(
+        "the region %S couldn't be closed due to incoming references.",
+        cown->value);
+    if (msg == NULL) {
+      return NULL;
+    }
+
+    PyObject *exc = PyObject_CallOneArg(PyExc_RuntimeError, msg);
+    Py_DECREF(msg);
+    if (exc == NULL) {
+      return NULL;
+    }
+
+    cown->exception = true;
+    Py_SETREF(cown->value, exc);
+    return object_to_xidata(cown->value, xidata_ptr);
+  }
+
+  // Closing the region was successful, we now need to store it for it to
+  // be opened later.
+  assert(close_res >= 1);
+
+  return region_to_xidata(cown, xidata_ptr);
+}
+#endif
 
 static inline int_least64_t cown_weak_decref(BOCCown *cown) {
   int_least64_t weak_rc = atomic_fetch_add(&cown->weak_rc, -1) - 1;
@@ -1769,7 +1863,15 @@ static int cown_release(BOCCown *cown) {
   assert(cown->value != NULL);
   assert(cown->xidata == NULL);
 
-  PyObject *pickled = object_to_xidata(cown->value, &cown->xidata);
+  PyObject *pickled = NULL;
+#ifdef TRACING_REGIONS
+  if (Region_Check(cown->value)) {
+    // Regions: The result may be pickled, if the region couldn't be closed
+    // and the cown stores an exception instead.
+    pickled = region_release(cown, &cown->xidata);
+  } else
+#endif
+    pickled = object_to_xidata(cown->value, &cown->xidata);
 
   if (pickled == NULL) {
     // Free the husk object_to_xidata left attached: it is unregistered, so a
