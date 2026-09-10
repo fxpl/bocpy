@@ -14,6 +14,8 @@
 #if PY_VERSION_HEX >= 0x030D0000
 #define Py_BUILD_CORE
 #include <internal/pycore_immutability.h>
+#include <internal/pycore_regionref.h>
+#include <internal/pycore_cown.h>
 #define Region_Check(x) Py_IS_TYPE((x), &_PyTracingRegion_Type)
 #undef Py_BUILD_CORE
 #else
@@ -1104,7 +1106,7 @@ static PyObject *xidata_to_region(XIDATA_T *xidata) {
   PyObject* region = xidata->obj;
   xidata->obj = NULL;
   xidata->data = NULL;
-  if (_PyTracingRegion_Open(region)) {
+  if (_PyTracingRegion_Attach(region, _PyCown_ThisInterpreterId(), _PyCown_ThisThreadId())) {
     return NULL;
   }
 
@@ -1136,35 +1138,9 @@ static PyObject *region_to_xidata(BOCCown *cown, XIDATA_T **xidata_ptr) {
 static PyObject* region_release(BOCCown *cown, XIDATA_T **xidata_ptr) {
   assert(Region_Check(cown->value));
 
-  int close_res = _PyTracingRegion_Close(cown->value);
-  if (close_res < 0) {
+  if (_PyTracingRegion_Detach(cown->value)) {
     return NULL;
   }
-
-  // If the region couldn't be closed, we need to create an exception and store
-  // it in the cown.
-  if (close_res == 0) {
-    PyObject *msg = PyUnicode_FromFormat(
-        "the region %S couldn't be closed due to incoming references.",
-        cown->value);
-    if (msg == NULL) {
-      return NULL;
-    }
-
-    PyObject *exc = PyObject_CallOneArg(PyExc_RuntimeError, msg);
-    Py_DECREF(msg);
-    if (exc == NULL) {
-      return NULL;
-    }
-
-    cown->exception = true;
-    Py_SETREF(cown->value, exc);
-    return object_to_xidata(cown->value, xidata_ptr);
-  }
-
-  // Closing the region was successful, we now need to store it for it to
-  // be opened later.
-  assert(close_res >= 1);
 
   return region_to_xidata(cown, xidata_ptr);
 }

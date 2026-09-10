@@ -1,128 +1,83 @@
-"""
-To run this benchmark you need to clone `https://github.com/fxpl/cpython` and
-build the `tracing-region` branch.
-
-make clean
-./configure --enable-optimizations
-make -j
-
-Then build a virtual environment in the root of this repo and install the bocpy
-repo on the `tracing-regions` branch. And then run the benchmark:
-
-../cpython/python.exe -m venv .venvpyrona
-source .venvpyrona/bin/activate.fish
-pip install -e . --verbose
-
-python pyrona.py
-"""
-
-
-import random
-import time
-import statistics
-
+from bocpy import Cown, start, when, wait
 from immutable import TracingRegion as Region
-from bocpy import Cown, when, wait
+from immutable import RegionRef as Weakref
+from immutable import set_freezable, FREEZABLE_YES
 
-SEED = 0
+import argparse
+import logging
 
-class Node:
-    def __init__(self, value=None):
-        self.value = value
-        self.left = None
-        self.right = None
 
-    def insert(self, value):
-        if self.value is None:      # empty root
-            self.value = value
-            return
-        node = self
-        while True:
-            if value < node.value:
-                if node.left is None:
-                    node.left = Node(value)
-                    return
-                node = node.left
-            else:
-                if node.right is None:
-                    node.right = Node(value)
-                    return
-                node = node.right
+class Account:
+    """Simple bank account with a name, balance, and frozen flag."""
 
-def populate(c: Cown, size: int = 10):
-    random.seed(SEED)
-    tree = Node()
-    for _ in range(size):
-        tree.insert(random.randint(0, 2**31 - 1))
+    def __init__(self, name: str, balance: float, frozen=False):
+        """Initialize an account with a starting balance."""
+        self.name = name
+        self.balance = balance
+        self.frozen = frozen
 
-    with c:
-        c.value.x = tree
-        tree = None
+    def __repr__(self) -> str:
+        """Return a readable representation for debugging."""
+        return f"Account(name='{self.name}', balance={self.balance}, frozen={self.frozen} [id={hex(id(self))}])"
 
-def _summary(samples):
-    return {
-        "min": min(samples),
-        "median": statistics.median(samples),
-        "mean": statistics.mean(samples),
-        "max": max(samples),
-        "std": statistics.stdev(samples) if len(samples) > 1 else 0.0,
-    }
 
-def benchmark_data(c: Cown, trials: int = 100, warmup: int = 10):
-    acquire, release = [], []
+def atomic_transfer(src: Cown[Region], dst: Cown[Region], amount: float):
+    """Move funds from ``src`` to ``dst`` if both are unfrozen and funded."""
 
-    for i in range(warmup + trials):
-        t0 = time.perf_counter_ns()
-        c.acquire()
-        t1 = time.perf_counter_ns()
+    @when(src, dst)
+    def do_transfer(src: Cown[Region], dst: Cown[Region], amount=amount):
+        src_account = src.value.account
+        dst_account = dst.value.account
+        print("attempting to transfer", amount, "from", src_account.name, "to", dst_account.name)
+        if src_account.balance > amount and not src_account.frozen and not dst_account.frozen:
+            src_account.balance -= amount
+            dst_account.balance += amount
+            print("success")
+        else:
+            print("failure")
 
-        c.release()
-        t2 = time.perf_counter_ns()
+        @when(src)
+        def _(a: Cown[Region]):
+            print("src (after transfer):", a.value.account)
 
-        if i >= warmup:
-            acquire.append((t1 - t0) / 1000.0)   # ns -> µs
-            release.append((t2 - t1) / 1000.0)
+        @when(dst)
+        def _(b: Cown[Region]):
+            print("dst (after transfer):", b.value.account)
 
-    return {"acquire": _summary(acquire), "release": _summary(release)}
 
-class A: pass
+def check_balance(message: str, account: Cown[Region]):
+    """Log the current balance of the provided account."""
+    @when(account)
+    def do_check(c: Cown[Region], message=message):
+        print(message, c.value.account)
 
-def main():
-    print(f"{'size':>5}, {'impl':<13}, {'op':<7}, "
-          f"{'min_us':>12}, {'median_us':>12}, {'mean_us':>12}, "
-          f"{'max_us':>12}, {'std_us':>12}")
 
-    for size in [1, 10, 100, 1000, 10000]:
-        c = Cown()
-        with c:
-            c.value = Region()
-        populate(c, size)
-        res1 = benchmark_data(c)
-        # This will raise an exception if something failed previously
-        out = c.unwrap()
-        assert(out.x is not None)
+def main(amount: int = None):
+    """Parse arguments, set up accounts, transfer, and display balances."""
+    parser = argparse.ArgumentParser("Bank Transfer")
+    parser.add_argument("--amount", "-a", type=int, default=50)
+    parser.add_argument("--loglevel", "-l", type=str, default=logging.WARNING)
+    args = parser.parse_args()
 
-        c = Cown()
-        with c:
-            c.value = A()
-        populate(c, size)
-        res2 = benchmark_data(c)
-        # This will raise an exception if something failed previously
-        out = c.unwrap()
-        assert(out.x is not None)
+    logging.basicConfig(level=args.loglevel)
 
-        for impl, res in (("TracingRegion", res1), ("Pickling", res2)):
-            for op in ("acquire", "release"):
-                s = res[op]
-                print(f"{size:>5}, {impl:<13}, {op:<7}, "
-                      f"{s['min']:>12.4f}, {s['median']:>12.4f}, {s['mean']:>12.4f}, "
-                      f"{s['max']:>12.4f}, {s['std']:>12.4f}")
+    if amount is None:
+        amount = args.amount
+
+    alice = Cown()
+    with alice:
+        alice.value = Region()
+        alice.value.account = Account("Alice", 100)
+    bob = Cown()
+    with bob:
+        bob.value = Region()
+        bob.value.account = Account("Bob", 0)
+
+    check_balance("src (before transfer):", alice)
+    check_balance("dst (before transfer):", bob)
+    atomic_transfer(alice, bob, amount)
+    wait()
+
 
 if __name__ == "__main__":
     main()
-
-
-
-
-# stats = wait(stats=True)
-# print(stats)

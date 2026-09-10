@@ -1,3 +1,9 @@
+```
+../cpython-tracing-regions/python.exe -m venv .venvpyrona
+source .venvpyrona/bin/activate.fish
+pip install -e . --verbose
+```
+
 # bocpy
 
 ![BOC Logo](http://microsoft.github.io/bocpy/images/logo.svg)
